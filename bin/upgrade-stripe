@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Install or upgrade the Stripe Magento module from a release .tgz.
+#
+# Usage: bin/upgrade-stripe /path/to/stripe-magento2-X.Y.Z.tgz
+#
+# See docs/UPGRADING_STRIPE.md for details and the manual steps.
+set -o errexit
+
+TGZ="$1"
+
+if [ -z "$TGZ" ]; then
+  echo "Usage: bin/upgrade-stripe /path/to/stripe-magento2-X.Y.Z.tgz"
+  exit 1
+fi
+if [ ! -f "$TGZ" ]; then
+  echo "Error: file not found: $TGZ"
+  exit 1
+fi
+if [ ! -d "src" ]; then
+  echo "Error: src/ not found. Run 'bin/download mageos 1.0.6' and 'bin/setup magento.test' first."
+  exit 1
+fi
+
+echo "==> Removing existing Stripe module (if any)..."
+rm -rf src/app/code/StripeIntegration
+
+echo "==> Extracting $TGZ into src/ ..."
+tar -xzf "$TGZ" -C src/
+
+if [ ! -d "src/app/code/StripeIntegration/Payments" ]; then
+  echo "Error: extracted archive does not contain app/code/StripeIntegration/Payments."
+  echo "       Is this a Stripe Magento module .tgz?"
+  exit 1
+fi
+
+NEWVER="$(cat src/app/code/StripeIntegration/Payments/VERSION.txt 2>/dev/null || echo '?')"
+echo "==> Module version in archive: $NEWVER"
+
+echo "==> Syncing module source into the container..."
+bin/copytocontainer --all
+
+# Detect the required stripe/stripe-php constraint from the module's install docs.
+SDK_CONSTRAINT="$(grep -rhoE "composer require (-W )?stripe/stripe-php:[^ ]+" \
+  src/app/code/StripeIntegration 2>/dev/null | head -1 | sed -E 's#.*stripe/stripe-php:##')"
+
+if [ -n "$SDK_CONSTRAINT" ]; then
+  echo "==> Requiring stripe/stripe-php:$SDK_CONSTRAINT ..."
+  bin/clinotty composer require stripe/stripe-php:"$SDK_CONSTRAINT"
+  echo "==> Syncing composer.json/composer.lock back to host..."
+  bin/copyfromcontainer composer.json
+  bin/copyfromcontainer composer.lock
+else
+  echo "==> WARNING: could not auto-detect the stripe/stripe-php constraint."
+  echo "    Check src/app/code/StripeIntegration/Payments/resources/docs/payments/install.md"
+  echo "    and run: bin/clinotty composer require stripe/stripe-php:<constraint>"
+fi
+
+echo "==> Enabling Stripe modules..."
+bin/clinotty bin/magento module:enable StripeIntegration_Tax StripeIntegration_Payments || true
+
+echo "==> Running setup:upgrade ..."
+bin/clinotty bin/magento setup:upgrade
+
+echo "==> Compiling DI ..."
+bin/clinotty bin/magento setup:di:compile
+
+echo "==> Flushing cache and fixing ownership/permissions ..."
+bin/clinotty bin/magento cache:flush
+bin/fixowns
+bin/fixperms
+
+echo ""
+echo "Done. Stripe module is now version: $(cat src/app/code/StripeIntegration/Payments/VERSION.txt 2>/dev/null || echo '?')"
+echo "stripe/stripe-php: $(bin/clinotty cat vendor/stripe/stripe-php/VERSION 2>/dev/null || echo '?')"
